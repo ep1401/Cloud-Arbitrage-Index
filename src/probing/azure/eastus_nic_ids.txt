@@ -10,7 +10,6 @@
 /subscriptions/cb303039-a277-48e3-a7c3-298d3a3bed04/resourceGroups/cai-probes-eastus/providers/Microsoft.Network/networkInterfaces/cai-nic-18
 /subscriptions/cb303039-a277-48e3-a7c3-298d3a3bed04/resourceGroups/cai-probes-eastus/providers/Microsoft.Network/networkInterfaces/cai-nic-19
 /subscriptions/cb303039-a277-48e3-a7c3-298d3a3bed04/resourceGroups/cai-probes-eastus/providers/Microsoft.Network/networkInterfaces/cai-nic-2
-/subscriptions/cb303039-a277-48e3-a7c3-298d3a3bed04/resourceGroups/cai-probes-eastus/providers/Microsoft.Network/networkInterfaces/cai-nic-20
 /subscriptions/cb303039-a277-48e3-a7c3-298d3a3bed04/resourceGroups/cai-probes-eastus/providers/Microsoft.Network/networkInterfaces/cai-nic-3
 /subscriptions/cb303039-a277-48e3-a7c3-298d3a3bed04/resourceGroups/cai-probes-eastus/providers/Microsoft.Network/networkInterfaces/cai-nic-4
 /subscriptions/cb303039-a277-48e3-a7c3-298d3a3bed04/resourceGroups/cai-probes-eastus/providers/Microsoft.Network/networkInterfaces/cai-nic-5
