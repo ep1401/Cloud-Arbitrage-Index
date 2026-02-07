@@ -720,30 +720,34 @@ def ingest_simple_metrics_into_engine(engine: CAIBandit):
 # ========================
 # Planning: uncertainty-driven + coverage penalty
 # ========================
-def _weighted_sample_without_replacement(items: List[str], scores: List[float], n: int) -> List[Tuple[str, float]]:
-    eps = 1e-9
-    chosen: List[Tuple[str, float]] = []
+def weighted_sample_with_replacement(
+    items: List[str], scores: List[float], n: int
+) -> List[Tuple[str, float]]:
+    """
+    Sample arms WITH replacement proportional to score.
 
-    pool = list(items)
-    if not pool or n <= 0:
-        return chosen
+    This allows multiple probes per arm per cycle.
+    This is what turns the scheduler into a true budget allocator.
+    """
+    if not items or n <= 0:
+        return []
 
     w = np.array(scores, dtype=float)
-    m = float(np.min(w)) if len(w) else 0.0
-    if m <= 0:
-        w = w - m + eps
 
-    for _ in range(min(n, len(pool))):
-        denom = float(np.sum(w))
-        probs = w / (denom if denom > 0 else len(w))
-        idx = int(np.random.choice(len(pool), p=probs))
-        chosen.append((pool[idx], float(probs[idx])))
-        pool.pop(idx)
-        w = np.delete(w, idx)
-        if len(w) == 0:
-            break
+    # shift scores positive
+    min_w = np.min(w)
+    if min_w <= 0:
+        w = w - min_w + 1e-9
+
+    probs = w / np.sum(w)
+
+    chosen = []
+    for _ in range(n):
+        idx = int(np.random.choice(len(items), p=probs))
+        chosen.append((items[idx], float(probs[idx])))
 
     return chosen
+
 
 
 def plan(engine: CAIBandit, now_ts: float) -> List[dict]:
@@ -767,7 +771,7 @@ def plan(engine: CAIBandit, now_ts: float) -> List[dict]:
     items = [k for k, _, _, _ in pool]
     scores = [s for _, s, _, _ in pool]
 
-    picks = _weighted_sample_without_replacement(items, scores, TOTAL_PROBES_PER_INTERVAL)
+    picks = weighted_sample_with_replacement(items, scores, TOTAL_PROBES_PER_INTERVAL)
 
     chosen = []
     for arm_key, pi in picks:
