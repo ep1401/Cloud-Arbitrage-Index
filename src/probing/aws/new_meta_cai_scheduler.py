@@ -75,7 +75,7 @@ H = 1
 
 # Probes
 TOTAL_PROBES_PER_INTERVAL = 24  # total probes launched each cycle
-PROBE_MIN = 5                 # minutes to monitor before censoring/terminating (set 60 for true 1h probes)
+PROBE_MIN = 60                 # minutes to monitor before censoring/terminating (set 60 for true 1h probes)
 
 # Ensemble / learning knobs
 RECENT_WINDOW_HOURS = 6        # sliding window length for RECENT expert
