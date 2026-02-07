@@ -74,7 +74,7 @@ STATUS_CHECK_SEC = 60
 H = 1
 
 # Probes
-TOTAL_PROBES_PER_INTERVAL = 2  # total probes launched each cycle
+TOTAL_PROBES_PER_INTERVAL = 24  # total probes launched each cycle
 PROBE_MIN = 5                 # minutes to monitor before censoring/terminating (set 60 for true 1h probes)
 
 # Ensemble / learning knobs
