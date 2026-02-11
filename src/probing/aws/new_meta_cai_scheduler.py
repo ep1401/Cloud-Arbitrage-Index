@@ -1,26 +1,28 @@
 """
 Meta-bandit CAI Scheduler (AWS) — Ensemble + 1-hour probes + persistence + MIN-4 top-up per cycle
 -----------------------------------------------------------------------------------------------
-Adds an hourly "top-up" rule:
+This version is identical to your original scheduler behavior, EXCEPT for the new backfilling rule:
 
 - Run the bandit plan exactly as before (TARGET 24 probes/cycle).
-- Keep a per-cycle (per-hour) in-memory count of probe ATTEMPTS per arm (pool).
+- Keep a per-cycle (per-hour) in-memory count of probe ATTEMPTS per arm.
   * A "probe attempt" counts even if launch fails.
 - After the bandit launches, if ANY arm has < MIN_PROBES_PER_ARM_PER_CYCLE attempts this cycle,
   launch additional "top-up" probes until it reaches the minimum.
   * This can push the total probes above 24 (allowed).
   * Top-up probe results are logged to a DIFFERENT table: probe_results_topup
-  * For top-ups, we try launch up to TOPUP_LAUNCH_TRIES times.
-    - If still fails, we log LaunchFailed to probe_results_topup and STILL increment the count by 1
-      so we never get stuck trying forever.
+  * For top-ups, try launch up to TOPUP_LAUNCH_TRIES times.
+    - If still fails, log LaunchFailed to probe_results_topup and STILL increment the count by 1
+      so we never get stuck in a loop.
 
-Bandit probes continue to log to probe_results (unchanged).
-Top-up probes log to probe_results_topup.
+IMPORTANT FIX INCLUDED (so it won't crash):
+- When loading persisted state, Supabase JSON can turn integer TOD block keys into strings.
+  This caused KeyError: 3 in new_cai_bandit.py.
+  We normalize TOD keys ("0","1","2","3") -> (0,1,2,3) after loading snapshot.
 
 Requires Supabase tables:
   - probe_results (existing)
   - probe_results_topup (new)
-  - cai_ensemble_state (existing for persistence)
+  - cai_ensemble_state (existing)
 
 NOTE: This only enforces MIN-4 for the CURRENT cycle/hour (in-memory), not across restarts.
 """
@@ -328,6 +330,33 @@ def extract_engine_state(engine: CAIBandit) -> dict:
     }
 
 
+def _normalize_tod_keys_inplace(engine: CAIBandit):
+    """
+    Fix KeyError: 3 caused by JSON round-tripping integer keys -> string keys.
+    Example: {"0": {...}, "1": {...}} becomes missing int keys 0/1.
+    """
+    tp = getattr(engine, "tod_posterior", None)
+    if not isinstance(tp, dict):
+        return
+
+    # already int-keyed?
+    if any(isinstance(k, int) for k in tp.keys()):
+        # still may have a mix; normalize anyway
+        pass
+
+    new_tp: Dict[int, Any] = {}
+    for k, v in tp.items():
+        try:
+            kk = int(k)
+        except Exception:
+            continue
+        new_tp[kk] = v
+
+    # If normalization produced something non-empty, apply it.
+    if new_tp:
+        engine.tod_posterior = new_tp
+
+
 def apply_engine_state(engine: CAIBandit, state: dict) -> bool:
     if not state:
         return False
@@ -343,6 +372,7 @@ def apply_engine_state(engine: CAIBandit, state: dict) -> bool:
     if isinstance(tod_post, dict) and hasattr(engine, "tod_posterior"):
         engine.tod_posterior = tod_post
 
+    # Keep compatibility with your bandit implementation (best-effort)
     if isinstance(hedge_w, dict):
         if hasattr(engine, "hedge_w"):
             engine.hedge_w = hedge_w
@@ -365,6 +395,9 @@ def apply_engine_state(engine: CAIBandit, state: dict) -> bool:
             )
         except Exception:
             pass
+
+    # IMPORTANT: fix TOD key typing after restore
+    _normalize_tod_keys_inplace(engine)
 
     print("[STATE] Applied model state snapshot into engine.")
     return True
@@ -505,9 +538,6 @@ def launch_spot_probe(region: str, instance_type: str):
 
 
 def launch_spot_probe_with_retries(region: str, instance_type: str, tries: int):
-    """
-    Try launching up to `tries` times. Returns the first success, else final failure.
-    """
     last_err = None
     last_features = None
     last_price = None
@@ -841,13 +871,13 @@ def enforce_min_probes_per_arm_this_cycle(
         print(f"[TOPUP] {arm_key} has {have}, needs +{need} more attempts.")
 
         for _ in range(need):
-            # Every top-up iteration MUST increment count by 1 no matter what (to avoid infinite loops).
-            # But we still try a real launch first.
             pred_h1 = current_pred_h1(engine, arm_key, now_ts=now_ts)
+
             iid, st, price_at_launch, price_delta6, features, err = launch_spot_probe_with_retries(
                 arm.region, arm.family, tries=TOPUP_LAUNCH_TRIES
             )
 
+            # Count attempt no matter what (prevents infinite loops)
             counts_this_cycle[arm_key] = int(counts_this_cycle.get(arm_key, 0)) + 1
 
             if iid and st:
@@ -864,7 +894,7 @@ def enforce_min_probes_per_arm_this_cycle(
                         price_delta6,
                         "topup",
                         "min4_topup",
-                        1.0,  # not a propensity sample; this is a rule-based top-up
+                        1.0,  # rule-based, not sampled
                         POLICY_VERSION,
                         pred_h1,
                         features,
@@ -875,7 +905,6 @@ def enforce_min_probes_per_arm_this_cycle(
                 th.start()
                 active_threads.append(th)
             else:
-                # Log the failure to the TOPUP table (and move on; we already incremented the count)
                 log_probe_result_topup(
                     provider=PROVIDER,
                     region=arm.region,
@@ -930,6 +959,7 @@ def run_meta_scheduler():
         neighbors_fn=neighbors_fn,
     )
 
+    # Load persisted state (if exists) + normalize TOD keys to avoid KeyError:3
     snap = load_latest_engine_state_from_db()
     if snap:
         apply_engine_state(engine, snap)
@@ -967,7 +997,7 @@ def run_meta_scheduler():
         selection = plan(engine, now_ts=now_ts)
         print("Planned probes:", selection)
 
-        # 3) launch bandit probes
+        # 3) launch bandit probes (unchanged behavior)
         for sel in selection:
             arm_key = sel["arm_key"]
             max_min = sel["max_minutes"]
@@ -976,9 +1006,7 @@ def run_meta_scheduler():
             pi = sel["sampling_propensity"]
 
             # Count attempt immediately (even if launch fails)
-            if arm_key not in counts_this_cycle:
-                counts_this_cycle[arm_key] = 0
-            counts_this_cycle[arm_key] += 1
+            counts_this_cycle[arm_key] = int(counts_this_cycle.get(arm_key, 0)) + 1
 
             arm = ARM_BY_KEY[arm_key]
             pred_h1 = current_pred_h1(engine, arm_key, now_ts=now_ts)
@@ -1009,7 +1037,6 @@ def run_meta_scheduler():
                 th.start()
                 active_threads.append(th)
             else:
-                # Bandit launch failure logs to main table (unchanged behavior)
                 log_probe_result_main(
                     provider=PROVIDER,
                     region=arm.region,
@@ -1034,7 +1061,7 @@ def run_meta_scheduler():
                     features_snapshot=features,
                 )
 
-        # 3b) enforce min attempts per arm (top-up) — may exceed 24 total
+        # 3b) NEW: enforce min attempts per arm (top-up) — may exceed 24 total
         enforce_min_probes_per_arm_this_cycle(
             engine=engine,
             now_ts=now_ts,
