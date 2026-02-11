@@ -1,23 +1,28 @@
 """
-Meta-bandit CAI Scheduler (AWS) — UPDATED for Ensemble + 1-hour probes + accuracy-learned weights + Option B persistence
-------------------------------------------------------------------------------------------------
-Adds Option B persistence of bandit state (GLOBAL/TOD posteriors + Hedge weights/losses) to Supabase.
+Meta-bandit CAI Scheduler (AWS) — Ensemble + 1-hour probes + persistence + MIN-4 top-up per cycle
+-----------------------------------------------------------------------------------------------
+Adds an hourly "top-up" rule:
 
-What this version does:
-  - Models 1-hour hazard (H=1).
-  - Uses CAIBandit ensemble + Hedge weight learning (your updated new_cai_bandit.py).
-  - Plans probes by uncertainty (CI width) + coverage shaping.
-  - Logs probe_results as before.
-  - Persists model state snapshots to Supabase table (default: `cai_ensemble_state`):
-      * On startup: loads latest snapshot (if exists), restores into engine
-      * Each cycle: saves snapshot (and also after each probe update for safety)
+- Run the bandit plan exactly as before (TARGET 24 probes/cycle).
+- Keep a per-cycle (per-hour) in-memory count of probe ATTEMPTS per arm (pool).
+  * A "probe attempt" counts even if launch fails.
+- After the bandit launches, if ANY arm has < MIN_PROBES_PER_ARM_PER_CYCLE attempts this cycle,
+  launch additional "top-up" probes until it reaches the minimum.
+  * This can push the total probes above 24 (allowed).
+  * Top-up probe results are logged to a DIFFERENT table: probe_results_topup
+  * For top-ups, we try launch up to TOPUP_LAUNCH_TRIES times.
+    - If still fails, we log LaunchFailed to probe_results_topup and STILL increment the count by 1
+      so we never get stuck trying forever.
 
-Requires:
-  - boto3, numpy, supabase-py, botocore
-  - new_cai_bandit.py in same folder (ensemble+hedge version)
-  - Supabase tables:
-      * probe_results (existing)
-      * cai_ensemble_state (or set CAI_MODEL_STATE_TABLE env var)
+Bandit probes continue to log to probe_results (unchanged).
+Top-up probes log to probe_results_topup.
+
+Requires Supabase tables:
+  - probe_results (existing)
+  - probe_results_topup (new)
+  - cai_ensemble_state (existing for persistence)
+
+NOTE: This only enforces MIN-4 for the CURRENT cycle/hour (in-memory), not across restarts.
 """
 
 import os
@@ -27,7 +32,7 @@ import datetime
 import threading
 import traceback
 from collections import defaultdict, deque
-from typing import Dict, Tuple, List, Optional, Any
+from typing import Dict, Tuple, List, Optional, Any, Callable
 
 import boto3
 import numpy as np
@@ -73,17 +78,21 @@ STATUS_CHECK_SEC = 60
 # 1-hour-only modeling horizon
 H = 1
 
-# Probes
-TOTAL_PROBES_PER_INTERVAL = 24  # total probes launched each cycle
-PROBE_MIN = 60                 # minutes to monitor before censoring/terminating (set 60 for true 1h probes)
+# Bandit probes (baseline)
+TOTAL_PROBES_PER_INTERVAL = 24
+PROBE_MIN = 60  # minutes to monitor before censoring/terminating (60 for true 1h probes)
+
+# NEW: per-cycle minimum probes per arm (pool)
+MIN_PROBES_PER_ARM_PER_CYCLE = 4
+TOPUP_LAUNCH_TRIES = 2  # try twice; if still fails, count it anyway
 
 # Ensemble / learning knobs
-RECENT_WINDOW_HOURS = 6        # sliding window length for RECENT expert
-TOD_BLOCK_HOURS = 6            # UTC blocks: 0-6,6-12,12-18,18-24
+RECENT_WINDOW_HOURS = 6
+TOD_BLOCK_HOURS = 6
 
-HEDGE_ETA = 0.06               # learning rate
-HEDGE_DECAY = 0.995            # loss decay
-WEIGHT_FLOOR = 0.05            # keep experts alive (regimes flip)
+HEDGE_ETA = 0.06
+HEDGE_DECAY = 0.995
+WEIGHT_FLOOR = 0.05
 
 # Planning knobs
 PLAN_MC_SAMPLES = 600
@@ -98,20 +107,20 @@ RHO_COVERAGE = 0.5
 # Event compatibility (optional; off by default)
 EVENT_THRESHOLD = 9999
 
-# Supabase (project creds) — prefer env vars in real deploys
+# Supabase
 SUPABASE_URL = "https://udrjcsighueuyyivsvnq.supabase.co"
 SUPABASE_KEY = "sb_publishable_K7YuRphF5F0k5b8I5LqpBQ_bVsbnjvZ"
 POLICY_VERSION = "meta_v3_ensemble_h1_hedge_persist"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Model state table name (Option B)
-# NOTE: your Supabase error suggested `cai_ensemble_state`, so that is the default here.
 MODEL_STATE_TABLE = os.environ.get("CAI_MODEL_STATE_TABLE", "cai_ensemble_state")
+
+# NEW: top-up table name
+TOPUP_TABLE = os.environ.get("CAI_TOPUP_TABLE", "probe_results_topup")
 
 # Snapshot cadence
 SAVE_SNAPSHOT_EVERY_CYCLE = True
-SAVE_SNAPSHOT_AFTER_EACH_UPDATE = True  # safest (writes more)
-
+SAVE_SNAPSHOT_AFTER_EACH_UPDATE = True
 
 # AWS
 EC2_CLIENTS = {r: boto3.client("ec2", region_name=r) for r in REGIONS}
@@ -198,9 +207,10 @@ def price_zscore6(region: str, instance_type: str) -> float:
 
 
 # ========================
-# DB Logging (probe_results schema)
+# DB Logging
 # ========================
-def log_probe_result(
+def _log_probe_result_to_table(
+    table: str,
     provider: str,
     region: str,
     instance_type: str,
@@ -222,7 +232,6 @@ def log_probe_result(
     pred_h1_at_launch: Optional[float],
     pred_risk_5h_at_launch: Optional[float],
     features_snapshot: Optional[dict],
-    launch_error: Optional[str] = None,  # not stored (schema compat)
 ):
     row = {
         "provider": provider,
@@ -248,10 +257,18 @@ def log_probe_result(
         "features_snapshot": features_snapshot,
     }
     try:
-        supabase.table("probe_results").insert(row).execute()
-        print(f"[DB] Logged: outcome={outcome} instance={instance_id or 'N/A'} arm={provider}:{region}:{instance_type}")
+        supabase.table(table).insert(row).execute()
+        print(f"[DB:{table}] Logged: outcome={outcome} instance={instance_id or 'N/A'} arm={provider}:{region}:{instance_type}")
     except Exception:
         traceback.print_exc()
+
+
+def log_probe_result_main(**kwargs):
+    _log_probe_result_to_table("probe_results", **kwargs)
+
+
+def log_probe_result_topup(**kwargs):
+    _log_probe_result_to_table(TOPUP_TABLE, **kwargs)
 
 
 # ========================
@@ -262,15 +279,8 @@ def _safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
 
 
 def extract_engine_state(engine: CAIBandit) -> dict:
-    """
-    JSON-serializable snapshot.
-
-    Important: we also capture weights_by_arm from engine.cai() because
-    that's the one place we KNOW the weights exist (you print them).
-    """
     now_ts = time.time()
 
-    # Guaranteed weights: pull from cai()
     try:
         cai_out = engine.cai(launch_ts=now_ts, mc_samples=300)
         weights_by_arm = {
@@ -281,7 +291,6 @@ def extract_engine_state(engine: CAIBandit) -> dict:
         traceback.print_exc()
         weights_by_arm = {}
 
-    # Best-effort "logw/losses" (depends on your bandit implementation)
     hedge_logw_by_arm = (
         _safe_getattr(engine, "hedge_logw_by_arm", None)
         or _safe_getattr(engine, "_hedge_logw_by_arm", None)
@@ -295,7 +304,7 @@ def extract_engine_state(engine: CAIBandit) -> dict:
     global_post = _safe_getattr(engine, "global_posterior", None) or _safe_getattr(engine, "global_post", None)
     tod_post = _safe_getattr(engine, "tod_posterior", None) or _safe_getattr(engine, "tod_post", None)
 
-    state = {
+    return {
         "provider": PROVIDER,
         "policy_version": POLICY_VERSION,
         "created_at_utc": datetime.datetime.utcnow().isoformat(),
@@ -317,11 +326,9 @@ def extract_engine_state(engine: CAIBandit) -> dict:
         "weights_by_arm": weights_by_arm,
         "hedge_logw_by_arm": hedge_logw_by_arm,
     }
-    return state
 
 
 def apply_engine_state(engine: CAIBandit, state: dict) -> bool:
-    """Restore engine state from snapshot dict."""
     if not state:
         return False
 
@@ -348,7 +355,6 @@ def apply_engine_state(engine: CAIBandit, state: dict) -> bool:
         if hasattr(engine, "_hedge_logw"):
             engine._hedge_logw = hedge_loss
 
-    # If your bandit exposes the helper, use it to keep aliases synced.
     if hasattr(engine, "apply_persisted_state"):
         try:
             engine.apply_persisted_state(
@@ -365,13 +371,6 @@ def apply_engine_state(engine: CAIBandit, state: dict) -> bool:
 
 
 def save_engine_state_to_db(engine: CAIBandit):
-    """
-    Insert snapshot row into MODEL_STATE_TABLE.
-
-    IMPORTANT: we write BOTH:
-      - state (full snapshot)
-      - weights_by_arm / hedge_logw_by_arm (legacy columns your UI shows)
-    """
     try:
         state = extract_engine_state(engine)
 
@@ -380,12 +379,8 @@ def save_engine_state_to_db(engine: CAIBandit):
             "policy_version": POLICY_VERSION,
             "snapshot_time_utc": datetime.datetime.utcnow().isoformat(),
             "state": state,
-
-            # Populate columns visible in your Supabase UI:
             "weights_by_arm": state.get("weights_by_arm", {}) or {},
             "hedge_logw_by_arm": state.get("hedge_logw_by_arm", {}) or {},
-
-            # Optional knobs (if you kept these columns)
             "hedge_eta": HEDGE_ETA,
             "hedge_decay": HEDGE_DECAY,
             "weight_floor": WEIGHT_FLOOR,
@@ -400,7 +395,6 @@ def save_engine_state_to_db(engine: CAIBandit):
 
 
 def load_latest_engine_state_from_db() -> Optional[dict]:
-    """Load latest snapshot from MODEL_STATE_TABLE for this provider + policy_version."""
     try:
         resp = (
             supabase.table(MODEL_STATE_TABLE)
@@ -510,6 +504,29 @@ def launch_spot_probe(region: str, instance_type: str):
         return None, None, price_at_launch, price_delta6, features, err
 
 
+def launch_spot_probe_with_retries(region: str, instance_type: str, tries: int):
+    """
+    Try launching up to `tries` times. Returns the first success, else final failure.
+    """
+    last_err = None
+    last_features = None
+    last_price = None
+    last_delta = None
+
+    for attempt in range(1, max(1, int(tries)) + 1):
+        iid, st, price_at_launch, price_delta6, features, err = launch_spot_probe(region, instance_type)
+        if iid and st:
+            return iid, st, price_at_launch, price_delta6, features, None
+        last_err = err
+        last_features = features
+        last_price = price_at_launch
+        last_delta = price_delta6
+        if attempt < tries:
+            time.sleep(1.5)
+
+    return None, None, last_price, last_delta, last_features, last_err
+
+
 def terminate_if_exists(region: str, instance_id: str):
     try:
         EC2_CLIENTS[region].terminate_instances(InstanceIds=[instance_id])
@@ -532,6 +549,7 @@ def monitor_probe(
     policy_version: str,
     pred_h1_at_launch: Optional[float],
     features_snapshot: dict,
+    log_fn: Callable[..., None],
 ):
     instance = EC2_RESOURCES[region].Instance(instance_id)
     arm_key = f"{PROVIDER}:{region}:{instance_type}"
@@ -556,7 +574,7 @@ def monitor_probe(
 
     if not appeared:
         end_time = datetime.datetime.utcnow()
-        log_probe_result(
+        log_fn(
             provider=PROVIDER,
             region=region,
             instance_type=instance_type,
@@ -614,7 +632,7 @@ def monitor_probe(
             if SAVE_SNAPSHOT_AFTER_EACH_UPDATE:
                 save_engine_state_to_db(engine)
 
-            log_probe_result(
+            log_fn(
                 provider=PROVIDER,
                 region=region,
                 instance_type=instance_type,
@@ -658,7 +676,7 @@ def monitor_probe(
     if SAVE_SNAPSHOT_AFTER_EACH_UPDATE:
         save_engine_state_to_db(engine)
 
-    log_probe_result(
+    log_fn(
         provider=PROVIDER,
         region=region,
         instance_type=instance_type,
@@ -720,21 +738,11 @@ def ingest_simple_metrics_into_engine(engine: CAIBandit):
 # ========================
 # Planning: uncertainty-driven + coverage penalty
 # ========================
-def weighted_sample_with_replacement(
-    items: List[str], scores: List[float], n: int
-) -> List[Tuple[str, float]]:
-    """
-    Sample arms WITH replacement proportional to score.
-
-    This allows multiple probes per arm per cycle.
-    This is what turns the scheduler into a true budget allocator.
-    """
+def weighted_sample_with_replacement(items: List[str], scores: List[float], n: int) -> List[Tuple[str, float]]:
     if not items or n <= 0:
         return []
 
     w = np.array(scores, dtype=float)
-
-    # shift scores positive
     min_w = np.min(w)
     if min_w <= 0:
         w = w - min_w + 1e-9
@@ -745,9 +753,7 @@ def weighted_sample_with_replacement(
     for _ in range(n):
         idx = int(np.random.choice(len(items), p=probs))
         chosen.append((items[idx], float(probs[idx])))
-
     return chosen
-
 
 
 def plan(engine: CAIBandit, now_ts: float) -> List[dict]:
@@ -770,7 +776,6 @@ def plan(engine: CAIBandit, now_ts: float) -> List[dict]:
 
     items = [k for k, _, _, _ in pool]
     scores = [s for _, s, _, _ in pool]
-
     picks = weighted_sample_with_replacement(items, scores, TOTAL_PROBES_PER_INTERVAL)
 
     chosen = []
@@ -810,6 +815,96 @@ def _print_cai_table(engine: CAIBandit, now_ts: float):
 
 
 # ========================
+# NEW: Top-up enforcement (min probes per arm per cycle)
+# ========================
+def enforce_min_probes_per_arm_this_cycle(
+    engine: CAIBandit,
+    now_ts: float,
+    counts_this_cycle: Dict[str, int],
+    active_threads: List[threading.Thread],
+):
+    """
+    After bandit launches, top up any arm with < MIN_PROBES_PER_ARM_PER_CYCLE attempts this cycle.
+
+    - Logs to TOPUP_TABLE.
+    - Launch tries: TOPUP_LAUNCH_TRIES. If still fails, log LaunchFailed and count anyway.
+    """
+    print(f"[TOPUP] Enforcing min={MIN_PROBES_PER_ARM_PER_CYCLE} probe-attempts per arm this cycle...")
+
+    for arm in ARMS:
+        arm_key = arm.key()
+        have = int(counts_this_cycle.get(arm_key, 0))
+        need = max(0, MIN_PROBES_PER_ARM_PER_CYCLE - have)
+        if need <= 0:
+            continue
+
+        print(f"[TOPUP] {arm_key} has {have}, needs +{need} more attempts.")
+
+        for _ in range(need):
+            # Every top-up iteration MUST increment count by 1 no matter what (to avoid infinite loops).
+            # But we still try a real launch first.
+            pred_h1 = current_pred_h1(engine, arm_key, now_ts=now_ts)
+            iid, st, price_at_launch, price_delta6, features, err = launch_spot_probe_with_retries(
+                arm.region, arm.family, tries=TOPUP_LAUNCH_TRIES
+            )
+
+            counts_this_cycle[arm_key] = int(counts_this_cycle.get(arm_key, 0)) + 1
+
+            if iid and st:
+                th = threading.Thread(
+                    target=monitor_probe,
+                    args=(
+                        arm.region,
+                        arm.family,
+                        iid,
+                        st,
+                        engine,
+                        PROBE_MIN,
+                        price_at_launch,
+                        price_delta6,
+                        "topup",
+                        "min4_topup",
+                        1.0,  # not a propensity sample; this is a rule-based top-up
+                        POLICY_VERSION,
+                        pred_h1,
+                        features,
+                        log_probe_result_topup,
+                    ),
+                )
+                th.daemon = True
+                th.start()
+                active_threads.append(th)
+            else:
+                # Log the failure to the TOPUP table (and move on; we already incremented the count)
+                log_probe_result_topup(
+                    provider=PROVIDER,
+                    region=arm.region,
+                    instance_type=arm.family,
+                    probe_kind="topup",
+                    meta_policy="min4_topup",
+                    max_minutes=PROBE_MIN,
+                    outcome="LaunchFailed",
+                    instance_id=None,
+                    start_time=None,
+                    end_time=datetime.datetime.utcnow(),
+                    duration_minutes=0.0,
+                    interrupted=False,
+                    interrupt_bin=None,
+                    survived_hours=0,
+                    spot_price_usd=price_at_launch,
+                    price_delta_6h=price_delta6,
+                    sampling_propensity=1.0,
+                    policy_version=POLICY_VERSION,
+                    pred_h1_at_launch=pred_h1,
+                    pred_risk_5h_at_launch=None,
+                    features_snapshot=features,
+                )
+                print(f"[TOPUP] LaunchFailed for {arm_key} after {TOPUP_LAUNCH_TRIES} tries; counted anyway. err={err}")
+
+    print("[TOPUP] Done enforcing per-arm minimums.")
+
+
+# ========================
 # Hourly loop
 # ========================
 def run_meta_scheduler():
@@ -835,7 +930,6 @@ def run_meta_scheduler():
         neighbors_fn=neighbors_fn,
     )
 
-    # ---- Option B: load latest state snapshot (if exists) ----
     snap = load_latest_engine_state_from_db()
     if snap:
         apply_engine_state(engine, snap)
@@ -847,7 +941,10 @@ def run_meta_scheduler():
         now_ts = time.time()
         print(f"\n=== META-CAI cycle {t0.isoformat()}Z ===")
 
-        # 1) feed metrics (safe while draining)
+        # Per-cycle attempt counts (THIS HOUR ONLY)
+        counts_this_cycle: Dict[str, int] = {a.key(): 0 for a in ARMS}
+
+        # 1) feed metrics
         ingest_simple_metrics_into_engine(engine)
 
         # Reap finished threads
@@ -855,7 +952,7 @@ def run_meta_scheduler():
         print(f"Active probes still running: {len(active_threads)}")
 
         if drain_enabled(args.drain):
-            print("[DRAIN] Draining mode is ON — no new launches will be started.")
+            print("[DRAIN] Draining mode is ON — no new launches will be started (including top-ups).")
             if not active_threads:
                 print("[DRAIN] All probes finished. Exiting scheduler.")
                 if SAVE_SNAPSHOT_EVERY_CYCLE:
@@ -866,17 +963,22 @@ def run_meta_scheduler():
             time.sleep(min(300, INTERVAL_MIN * 60))
             continue
 
-        # 2) plan probes
+        # 2) plan bandit probes
         selection = plan(engine, now_ts=now_ts)
         print("Planned probes:", selection)
 
-        # 3) launch & monitor
+        # 3) launch bandit probes
         for sel in selection:
             arm_key = sel["arm_key"]
             max_min = sel["max_minutes"]
             probe_kind = sel["probe_kind"]
             meta_pol = sel["meta_policy"]
             pi = sel["sampling_propensity"]
+
+            # Count attempt immediately (even if launch fails)
+            if arm_key not in counts_this_cycle:
+                counts_this_cycle[arm_key] = 0
+            counts_this_cycle[arm_key] += 1
 
             arm = ARM_BY_KEY[arm_key]
             pred_h1 = current_pred_h1(engine, arm_key, now_ts=now_ts)
@@ -900,13 +1002,15 @@ def run_meta_scheduler():
                         POLICY_VERSION,
                         pred_h1,
                         features,
+                        log_probe_result_main,
                     ),
                 )
                 th.daemon = True
                 th.start()
                 active_threads.append(th)
             else:
-                log_probe_result(
+                # Bandit launch failure logs to main table (unchanged behavior)
+                log_probe_result_main(
                     provider=PROVIDER,
                     region=arm.region,
                     instance_type=arm.family,
@@ -916,7 +1020,7 @@ def run_meta_scheduler():
                     outcome="LaunchFailed",
                     instance_id=None,
                     start_time=None,
-                    end_time=None,
+                    end_time=datetime.datetime.utcnow(),
                     duration_minutes=0.0,
                     interrupted=False,
                     interrupt_bin=None,
@@ -928,10 +1032,17 @@ def run_meta_scheduler():
                     pred_h1_at_launch=pred_h1,
                     pred_risk_5h_at_launch=None,
                     features_snapshot=features,
-                    launch_error=err,
                 )
 
-        # 4) report CAI (robust to weights being a string)
+        # 3b) enforce min attempts per arm (top-up) — may exceed 24 total
+        enforce_min_probes_per_arm_this_cycle(
+            engine=engine,
+            now_ts=now_ts,
+            counts_this_cycle=counts_this_cycle,
+            active_threads=active_threads,
+        )
+
+        # 4) report CAI
         _print_cai_table(engine, now_ts=now_ts)
 
         # 5) persist snapshot once per cycle
