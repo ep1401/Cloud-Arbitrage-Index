@@ -1,28 +1,33 @@
 """
-Meta-bandit CAI Scheduler (AWS) — Ensemble + 1-hour probes + persistence + MIN-4 top-up per cycle
------------------------------------------------------------------------------------------------
-This version is identical to your original scheduler behavior, EXCEPT for the new backfilling rule:
+Meta-bandit CAI Scheduler (AWS) — Ensemble + 1-hour probes + Option B persistence + MIN-4 top-up per cycle
+--------------------------------------------------------------------------------------------------------
+This is your ORIGINAL working scheduler with ONE functional change: per-cycle min-probe backfilling.
+
+Adds an hourly "top-up" rule:
 
 - Run the bandit plan exactly as before (TARGET 24 probes/cycle).
-- Keep a per-cycle (per-hour) in-memory count of probe ATTEMPTS per arm.
+- Keep a per-cycle (per-hour) in-memory count of probe ATTEMPTS per arm (pool).
   * A "probe attempt" counts even if launch fails.
 - After the bandit launches, if ANY arm has < MIN_PROBES_PER_ARM_PER_CYCLE attempts this cycle,
   launch additional "top-up" probes until it reaches the minimum.
   * This can push the total probes above 24 (allowed).
   * Top-up probe results are logged to a DIFFERENT table: probe_results_topup
-  * For top-ups, try launch up to TOPUP_LAUNCH_TRIES times.
-    - If still fails, log LaunchFailed to probe_results_topup and STILL increment the count by 1
-      so we never get stuck in a loop.
+  * For top-ups, we try launch up to TOPUP_LAUNCH_TRIES times.
+    - If still fails, we log LaunchFailed to probe_results_topup and STILL increment the count by 1
+      so we never get stuck trying forever.
 
-IMPORTANT FIX INCLUDED (so it won't crash):
-- When loading persisted state, Supabase JSON can turn integer TOD block keys into strings.
-  This caused KeyError: 3 in new_cai_bandit.py.
-  We normalize TOD keys ("0","1","2","3") -> (0,1,2,3) after loading snapshot.
+IMPORTANT FIX:
+- When restoring persistence snapshots, normalize posterior keys:
+    blocks "0","1","2","3" -> ints 0,1,2,3
+    horizons "1" -> int 1
+  and fill any missing blocks/arms/horizons with (alpha0,beta0),
+  so new_cai_bandit never KeyErrors at:
+      self.tod_posterior[block][arm_key][1]
 
 Requires Supabase tables:
   - probe_results (existing)
-  - probe_results_topup (new)
-  - cai_ensemble_state (existing)
+  - probe_results_topup (new; same schema as probe_results)
+  - cai_ensemble_state (existing for persistence)
 
 NOTE: This only enforces MIN-4 for the CURRENT cycle/hour (in-memory), not across restarts.
 """
@@ -80,21 +85,21 @@ STATUS_CHECK_SEC = 60
 # 1-hour-only modeling horizon
 H = 1
 
-# Bandit probes (baseline)
-TOTAL_PROBES_PER_INTERVAL = 24
-PROBE_MIN = 60  # minutes to monitor before censoring/terminating (60 for true 1h probes)
+# Probes
+TOTAL_PROBES_PER_INTERVAL = 24  # total probes launched each cycle
+PROBE_MIN = 60                  # minutes to monitor before censoring/terminating (set 60 for true 1h probes)
 
-# NEW: per-cycle minimum probes per arm (pool)
+# NEW: min attempts per arm per cycle + top-up launch behavior
 MIN_PROBES_PER_ARM_PER_CYCLE = 4
-TOPUP_LAUNCH_TRIES = 2  # try twice; if still fails, count it anyway
+TOPUP_LAUNCH_TRIES = 2
 
 # Ensemble / learning knobs
-RECENT_WINDOW_HOURS = 6
-TOD_BLOCK_HOURS = 6
+RECENT_WINDOW_HOURS = 6        # sliding window length for RECENT expert
+TOD_BLOCK_HOURS = 6            # UTC blocks: 0-6,6-12,12-18,18-24
 
-HEDGE_ETA = 0.06
-HEDGE_DECAY = 0.995
-WEIGHT_FLOOR = 0.05
+HEDGE_ETA = 0.06               # learning rate
+HEDGE_DECAY = 0.995            # loss decay
+WEIGHT_FLOOR = 0.05            # keep experts alive (regimes flip)
 
 # Planning knobs
 PLAN_MC_SAMPLES = 600
@@ -116,13 +121,11 @@ POLICY_VERSION = "meta_v3_ensemble_h1_hedge_persist"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 MODEL_STATE_TABLE = os.environ.get("CAI_MODEL_STATE_TABLE", "cai_ensemble_state")
-
-# NEW: top-up table name
 TOPUP_TABLE = os.environ.get("CAI_TOPUP_TABLE", "probe_results_topup")
 
 # Snapshot cadence
 SAVE_SNAPSHOT_EVERY_CYCLE = True
-SAVE_SNAPSHOT_AFTER_EACH_UPDATE = True
+SAVE_SNAPSHOT_AFTER_EACH_UPDATE = True  # safest (writes more)
 
 # AWS
 EC2_CLIENTS = {r: boto3.client("ec2", region_name=r) for r in REGIONS}
@@ -209,10 +212,17 @@ def price_zscore6(region: str, instance_type: str) -> float:
 
 
 # ========================
-# DB Logging
+# DB Logging (probe_results schema)
 # ========================
-def _log_probe_result_to_table(
-    table: str,
+def _insert_probe_row(table: str, row: dict):
+    try:
+        supabase.table(table).insert(row).execute()
+        print(f"[DB:{table}] Logged: outcome={row.get('outcome')} instance={row.get('instance_id') or 'N/A'} arm={row.get('provider')}:{row.get('region')}:{row.get('instance_type')}")
+    except Exception:
+        traceback.print_exc()
+
+
+def log_probe_result(
     provider: str,
     region: str,
     instance_type: str,
@@ -234,6 +244,7 @@ def _log_probe_result_to_table(
     pred_h1_at_launch: Optional[float],
     pred_risk_5h_at_launch: Optional[float],
     features_snapshot: Optional[dict],
+    launch_error: Optional[str] = None,  # not stored (schema compat)
 ):
     row = {
         "provider": provider,
@@ -258,19 +269,57 @@ def _log_probe_result_to_table(
         "pred_risk_5h_at_launch": None if pred_risk_5h_at_launch is None else float(pred_risk_5h_at_launch),
         "features_snapshot": features_snapshot,
     }
-    try:
-        supabase.table(table).insert(row).execute()
-        print(f"[DB:{table}] Logged: outcome={outcome} instance={instance_id or 'N/A'} arm={provider}:{region}:{instance_type}")
-    except Exception:
-        traceback.print_exc()
-
-
-def log_probe_result_main(**kwargs):
-    _log_probe_result_to_table("probe_results", **kwargs)
+    _insert_probe_row("probe_results", row)
 
 
 def log_probe_result_topup(**kwargs):
-    _log_probe_result_to_table(TOPUP_TABLE, **kwargs)
+    # exact same schema, just different table
+    provider = kwargs["provider"]
+    region = kwargs["region"]
+    instance_type = kwargs["instance_type"]
+    probe_kind = kwargs["probe_kind"]
+    meta_policy = kwargs["meta_policy"]
+    max_minutes = kwargs["max_minutes"]
+    outcome = kwargs["outcome"]
+    instance_id = kwargs.get("instance_id")
+    start_time = kwargs.get("start_time")
+    end_time = kwargs.get("end_time")
+    duration_minutes = kwargs.get("duration_minutes", 0.0)
+    interrupted = kwargs.get("interrupted", False)
+    interrupt_bin = kwargs.get("interrupt_bin")
+    survived_hours = kwargs.get("survived_hours", 0)
+    spot_price_usd = kwargs.get("spot_price_usd")
+    price_delta_6h = kwargs.get("price_delta_6h")
+    sampling_propensity = kwargs.get("sampling_propensity")
+    policy_version = kwargs.get("policy_version")
+    pred_h1_at_launch = kwargs.get("pred_h1_at_launch")
+    pred_risk_5h_at_launch = kwargs.get("pred_risk_5h_at_launch")
+    features_snapshot = kwargs.get("features_snapshot")
+
+    row = {
+        "provider": provider,
+        "region": region,
+        "instance_type": instance_type,
+        "probe_kind": probe_kind,
+        "meta_policy": meta_policy,
+        "max_minutes": max_minutes,
+        "policy_version": policy_version,
+        "instance_id": instance_id if instance_id else None,
+        "outcome": outcome,
+        "start_time_utc": start_time.isoformat() if start_time else None,
+        "end_time_utc": end_time.isoformat() if end_time else None,
+        "duration_minutes": round(float(duration_minutes or 0.0), 2),
+        "interrupted": bool(interrupted),
+        "interrupt_bin": interrupt_bin,
+        "survived_hours": survived_hours,
+        "spot_price_usd": None if spot_price_usd is None else float(spot_price_usd),
+        "price_delta_6h": None if price_delta_6h is None else float(price_delta_6h),
+        "sampling_propensity": None if sampling_propensity is None else float(sampling_propensity),
+        "pred_h1_at_launch": None if pred_h1_at_launch is None else float(pred_h1_at_launch),
+        "pred_risk_5h_at_launch": None if pred_risk_5h_at_launch is None else float(pred_risk_5h_at_launch),
+        "features_snapshot": features_snapshot,
+    }
+    _insert_probe_row(TOPUP_TABLE, row)
 
 
 # ========================
@@ -281,8 +330,15 @@ def _safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
 
 
 def extract_engine_state(engine: CAIBandit) -> dict:
+    """
+    JSON-serializable snapshot.
+
+    Important: we also capture weights_by_arm from engine.cai() because
+    that's the one place we KNOW the weights exist (you print them).
+    """
     now_ts = time.time()
 
+    # Guaranteed weights: pull from cai()
     try:
         cai_out = engine.cai(launch_ts=now_ts, mc_samples=300)
         weights_by_arm = {
@@ -306,7 +362,7 @@ def extract_engine_state(engine: CAIBandit) -> dict:
     global_post = _safe_getattr(engine, "global_posterior", None) or _safe_getattr(engine, "global_post", None)
     tod_post = _safe_getattr(engine, "tod_posterior", None) or _safe_getattr(engine, "tod_post", None)
 
-    return {
+    state = {
         "provider": PROVIDER,
         "policy_version": POLICY_VERSION,
         "created_at_utc": datetime.datetime.utcnow().isoformat(),
@@ -328,78 +384,153 @@ def extract_engine_state(engine: CAIBandit) -> dict:
         "weights_by_arm": weights_by_arm,
         "hedge_logw_by_arm": hedge_logw_by_arm,
     }
+    return state
 
 
-def _normalize_tod_keys_inplace(engine: CAIBandit):
-    """
-    Fix KeyError: 3 caused by JSON round-tripping integer keys -> string keys.
-    Example: {"0": {...}, "1": {...}} becomes missing int keys 0/1.
-    """
-    tp = getattr(engine, "tod_posterior", None)
-    if not isinstance(tp, dict):
-        return
-
-    # already int-keyed?
-    if any(isinstance(k, int) for k in tp.keys()):
-        # still may have a mix; normalize anyway
-        pass
-
-    new_tp: Dict[int, Any] = {}
-    for k, v in tp.items():
+def _maybe_int_key(k: Any) -> Any:
+    # Convert "0" -> 0, "1" -> 1; leave others alone.
+    if isinstance(k, int):
+        return k
+    if isinstance(k, str) and k.isdigit():
         try:
-            kk = int(k)
+            return int(k)
         except Exception:
-            continue
-        new_tp[kk] = v
+            return k
+    return k
 
-    # If normalization produced something non-empty, apply it.
-    if new_tp:
-        engine.tod_posterior = new_tp
+
+def _normalize_arm_posterior(
+    arm_post: Any,
+    H: int,
+    alpha0: float,
+    beta0: float,
+) -> Dict[int, List[float]]:
+    """
+    arm_post expected shape:
+        { 1: [a,b] } or { "1": [a,b] }
+    Returns:
+        { 1: [a,b], 2: [a,b], ... } (only ensures H exists; doesn't invent more)
+    """
+    out: Dict[int, List[float]] = {}
+    if isinstance(arm_post, dict):
+        for hk, hv in arm_post.items():
+            hk2 = _maybe_int_key(hk)
+            if isinstance(hk2, int):
+                out[hk2] = hv
+    # ensure horizon H exists
+    if H not in out:
+        out[H] = [float(alpha0), float(beta0)]
+    return out
+
+
+def _normalize_global_posterior(
+    glob: Any,
+    arms: List[Arm],
+    H: int,
+    alpha0: float,
+    beta0: float,
+) -> Dict[str, Dict[int, List[float]]]:
+    out: Dict[str, Dict[int, List[float]]] = {}
+    if isinstance(glob, dict):
+        for arm_key, arm_post in glob.items():
+            out[str(arm_key)] = _normalize_arm_posterior(arm_post, H, alpha0, beta0)
+
+    # ensure every arm exists
+    for a in arms:
+        k = a.key()
+        if k not in out:
+            out[k] = {H: [float(alpha0), float(beta0)]}
+        else:
+            if H not in out[k]:
+                out[k][H] = [float(alpha0), float(beta0)]
+    return out
+
+
+def _normalize_tod_posterior(
+    tod: Any,
+    arms: List[Arm],
+    tod_block_hours: int,
+    H: int,
+    alpha0: float,
+    beta0: float,
+) -> Dict[int, Dict[str, Dict[int, List[float]]]]:
+    """
+    Expected shape from DB:
+      {
+        "0": { "aws:...": {"1":[a,b]} , ... },
+        "1": { ... },
+        ...
+      }
+
+    Returns:
+      {
+        0: { "aws:...": {1:[a,b]} , ... },
+        1: ...
+      }
+    and ensures ALL blocks 0..num_blocks-1 exist, and all arms have horizon H.
+    """
+    num_blocks = int(24 // max(1, int(tod_block_hours)))
+    out: Dict[int, Dict[str, Dict[int, List[float]]]] = {}
+
+    # ingest existing
+    if isinstance(tod, dict):
+        for bk, bmap in tod.items():
+            b = _maybe_int_key(bk)
+            if not isinstance(b, int):
+                continue
+            if not isinstance(bmap, dict):
+                continue
+            out[b] = {}
+            for arm_key, arm_post in bmap.items():
+                out[b][str(arm_key)] = _normalize_arm_posterior(arm_post, H, alpha0, beta0)
+
+    # ensure all blocks + all arms
+    for b in range(num_blocks):
+        if b not in out:
+            out[b] = {}
+        for a in arms:
+            k = a.key()
+            if k not in out[b]:
+                out[b][k] = {H: [float(alpha0), float(beta0)]}
+            else:
+                if H not in out[b][k]:
+                    out[b][k][H] = [float(alpha0), float(beta0)]
+    return out
 
 
 def apply_engine_state(engine: CAIBandit, state: dict) -> bool:
+    """
+    Restore engine state from snapshot dict.
+
+    CRITICAL: normalize keys so new_cai_bandit can index with ints:
+      tod_posterior[block:int][arm_key][H:int]
+      global_posterior[arm_key][H:int]
+    """
     if not state:
         return False
 
-    global_post = state.get("global_posterior")
-    tod_post = state.get("tod_posterior")
-    hedge_w = state.get("hedge_weights")
-    hedge_loss = state.get("hedge_losses")
+    alpha0 = float(_safe_getattr(engine, "alpha0", 1.0))
+    beta0 = float(_safe_getattr(engine, "beta0", 19.0))
+    H_engine = int(_safe_getattr(engine, "H", 1))
+    tod_block_hours = int(_safe_getattr(engine, "tod_block_hours", TOD_BLOCK_HOURS))
 
-    if isinstance(global_post, dict) and hasattr(engine, "global_posterior"):
-        engine.global_posterior = global_post
+    global_post_raw = state.get("global_posterior")
+    tod_post_raw = state.get("tod_posterior")
 
-    if isinstance(tod_post, dict) and hasattr(engine, "tod_posterior"):
-        engine.tod_posterior = tod_post
-
-    # Keep compatibility with your bandit implementation (best-effort)
-    if isinstance(hedge_w, dict):
-        if hasattr(engine, "hedge_w"):
-            engine.hedge_w = hedge_w
-        if hasattr(engine, "hedge_weights"):
-            engine.hedge_weights = hedge_w
-
-    if isinstance(hedge_loss, dict):
-        if hasattr(engine, "hedge_loss"):
-            engine.hedge_loss = hedge_loss
-        if hasattr(engine, "_hedge_logw"):
-            engine._hedge_logw = hedge_loss
-
-    if hasattr(engine, "apply_persisted_state"):
-        try:
-            engine.apply_persisted_state(
-                global_posterior=global_post if isinstance(global_post, dict) else None,
-                tod_posterior=tod_post if isinstance(tod_post, dict) else None,
-                hedge_w=hedge_w if isinstance(hedge_w, dict) else None,
-                hedge_loss=hedge_loss if isinstance(hedge_loss, dict) else None,
+    try:
+        if hasattr(engine, "global_posterior"):
+            engine.global_posterior = _normalize_global_posterior(
+                global_post_raw, ARMS, H_engine, alpha0, beta0
             )
-        except Exception:
-            pass
+        if hasattr(engine, "tod_posterior"):
+            engine.tod_posterior = _normalize_tod_posterior(
+                tod_post_raw, ARMS, tod_block_hours, H_engine, alpha0, beta0
+            )
+    except Exception:
+        traceback.print_exc()
+        print("[STATE] Failed to normalize/apply posterior state; continuing with fresh priors.")
 
-    # IMPORTANT: fix TOD key typing after restore
-    _normalize_tod_keys_inplace(engine)
-
-    print("[STATE] Applied model state snapshot into engine.")
+    print("[STATE] Applied model state snapshot into engine (with key normalization).")
     return True
 
 
@@ -428,6 +559,7 @@ def save_engine_state_to_db(engine: CAIBandit):
 
 
 def load_latest_engine_state_from_db() -> Optional[dict]:
+    """Load latest snapshot from MODEL_STATE_TABLE for this provider + policy_version."""
     try:
         resp = (
             supabase.table(MODEL_STATE_TABLE)
@@ -579,7 +711,7 @@ def monitor_probe(
     policy_version: str,
     pred_h1_at_launch: Optional[float],
     features_snapshot: dict,
-    log_fn: Callable[..., None],
+    log_fn: Callable[..., None] = log_probe_result,  # default preserves original behavior
 ):
     instance = EC2_RESOURCES[region].Instance(instance_id)
     arm_key = f"{PROVIDER}:{region}:{instance_type}"
@@ -768,11 +900,14 @@ def ingest_simple_metrics_into_engine(engine: CAIBandit):
 # ========================
 # Planning: uncertainty-driven + coverage penalty
 # ========================
-def weighted_sample_with_replacement(items: List[str], scores: List[float], n: int) -> List[Tuple[str, float]]:
+def weighted_sample_with_replacement(
+    items: List[str], scores: List[float], n: int
+) -> List[Tuple[str, float]]:
     if not items or n <= 0:
         return []
 
     w = np.array(scores, dtype=float)
+
     min_w = np.min(w)
     if min_w <= 0:
         w = w - min_w + 1e-9
@@ -783,6 +918,7 @@ def weighted_sample_with_replacement(items: List[str], scores: List[float], n: i
     for _ in range(n):
         idx = int(np.random.choice(len(items), p=probs))
         chosen.append((items[idx], float(probs[idx])))
+
     return chosen
 
 
@@ -806,6 +942,7 @@ def plan(engine: CAIBandit, now_ts: float) -> List[dict]:
 
     items = [k for k, _, _, _ in pool]
     scores = [s for _, s, _, _ in pool]
+
     picks = weighted_sample_with_replacement(items, scores, TOTAL_PROBES_PER_INTERVAL)
 
     chosen = []
@@ -845,7 +982,7 @@ def _print_cai_table(engine: CAIBandit, now_ts: float):
 
 
 # ========================
-# NEW: Top-up enforcement (min probes per arm per cycle)
+# NEW: Top-up enforcement
 # ========================
 def enforce_min_probes_per_arm_this_cycle(
     engine: CAIBandit,
@@ -853,12 +990,6 @@ def enforce_min_probes_per_arm_this_cycle(
     counts_this_cycle: Dict[str, int],
     active_threads: List[threading.Thread],
 ):
-    """
-    After bandit launches, top up any arm with < MIN_PROBES_PER_ARM_PER_CYCLE attempts this cycle.
-
-    - Logs to TOPUP_TABLE.
-    - Launch tries: TOPUP_LAUNCH_TRIES. If still fails, log LaunchFailed and count anyway.
-    """
     print(f"[TOPUP] Enforcing min={MIN_PROBES_PER_ARM_PER_CYCLE} probe-attempts per arm this cycle...")
 
     for arm in ARMS:
@@ -877,7 +1008,7 @@ def enforce_min_probes_per_arm_this_cycle(
                 arm.region, arm.family, tries=TOPUP_LAUNCH_TRIES
             )
 
-            # Count attempt no matter what (prevents infinite loops)
+            # IMPORTANT: count attempt no matter what (prevents infinite loop)
             counts_this_cycle[arm_key] = int(counts_this_cycle.get(arm_key, 0)) + 1
 
             if iid and st:
@@ -894,7 +1025,7 @@ def enforce_min_probes_per_arm_this_cycle(
                         price_delta6,
                         "topup",
                         "min4_topup",
-                        1.0,  # rule-based, not sampled
+                        1.0,
                         POLICY_VERSION,
                         pred_h1,
                         features,
@@ -959,7 +1090,7 @@ def run_meta_scheduler():
         neighbors_fn=neighbors_fn,
     )
 
-    # Load persisted state (if exists) + normalize TOD keys to avoid KeyError:3
+    # ---- Option B: load latest state snapshot (if exists) ----
     snap = load_latest_engine_state_from_db()
     if snap:
         apply_engine_state(engine, snap)
@@ -974,7 +1105,7 @@ def run_meta_scheduler():
         # Per-cycle attempt counts (THIS HOUR ONLY)
         counts_this_cycle: Dict[str, int] = {a.key(): 0 for a in ARMS}
 
-        # 1) feed metrics
+        # 1) feed metrics (safe while draining)
         ingest_simple_metrics_into_engine(engine)
 
         # Reap finished threads
@@ -993,11 +1124,11 @@ def run_meta_scheduler():
             time.sleep(min(300, INTERVAL_MIN * 60))
             continue
 
-        # 2) plan bandit probes
+        # 2) plan probes
         selection = plan(engine, now_ts=now_ts)
         print("Planned probes:", selection)
 
-        # 3) launch bandit probes (unchanged behavior)
+        # 3) launch & monitor (bandit probes; unchanged logging to probe_results)
         for sel in selection:
             arm_key = sel["arm_key"]
             max_min = sel["max_minutes"]
@@ -1030,14 +1161,15 @@ def run_meta_scheduler():
                         POLICY_VERSION,
                         pred_h1,
                         features,
-                        log_probe_result_main,
+                        log_probe_result,  # main table (original behavior)
                     ),
                 )
                 th.daemon = True
                 th.start()
                 active_threads.append(th)
             else:
-                log_probe_result_main(
+                # Bandit launch failure logs to main table (unchanged behavior)
+                log_probe_result(
                     provider=PROVIDER,
                     region=arm.region,
                     instance_type=arm.family,
@@ -1059,9 +1191,10 @@ def run_meta_scheduler():
                     pred_h1_at_launch=pred_h1,
                     pred_risk_5h_at_launch=None,
                     features_snapshot=features,
+                    launch_error=err,
                 )
 
-        # 3b) NEW: enforce min attempts per arm (top-up) — may exceed 24 total
+        # 3b) enforce per-arm minimum attempts (top-ups; logs to probe_results_topup)
         enforce_min_probes_per_arm_this_cycle(
             engine=engine,
             now_ts=now_ts,
