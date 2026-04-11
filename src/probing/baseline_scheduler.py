@@ -1,37 +1,3 @@
-"""
-Meta-bandit CAI Scheduler (AWS) — Ensemble + 1-hour probes + Option B persistence + MIN-4 top-up per cycle
---------------------------------------------------------------------------------------------------------
-This is your ORIGINAL working scheduler with ONE functional change: per-cycle min-probe backfilling.
-
-Adds an hourly "top-up" rule:
-
-- Run the bandit plan exactly as before (TARGET 24 probes/cycle).
-- Keep a per-cycle (per-hour) in-memory count of probe ATTEMPTS per arm (pool).
-  * A "probe attempt" counts even if launch fails.
-- After the bandit launches, if ANY arm has < MIN_PROBES_PER_ARM_PER_CYCLE attempts this cycle,
-  launch additional "top-up" probes until it reaches the minimum.
-  * This can push the total probes above 24 (allowed).
-  * Top-up probe results are logged to a DIFFERENT table: probe_results_topup
-  * For top-ups, we try launch up to TOPUP_LAUNCH_TRIES times.
-    - If still fails, we log LaunchFailed to probe_results_topup and STILL increment the count by 1
-      so we never get stuck trying forever.
-
-IMPORTANT FIX:
-- When restoring persistence snapshots, normalize posterior keys:
-    blocks "0","1","2","3" -> ints 0,1,2,3
-    horizons "1" -> int 1
-  and fill any missing blocks/arms/horizons with (alpha0,beta0),
-  so new_cai_bandit never KeyErrors at:
-      self.tod_posterior[block][arm_key][1]
-
-Requires Supabase tables:
-  - probe_results (existing)
-  - probe_results_topup (new; same schema as probe_results)
-  - cai_ensemble_state (existing for persistence)
-
-NOTE: This only enforces MIN-4 for the CURRENT cycle/hour (in-memory), not across restarts.
-"""
-
 import os
 import time
 import argparse
@@ -46,7 +12,7 @@ import numpy as np
 from botocore.exceptions import ClientError
 from supabase import create_client, Client
 
-from new_cai_bandit import CAIBandit, Arm, ProbeResult
+from probing.cai_bandit import CAIBandit, Arm, ProbeResult
 
 
 # ============ Drain controls ============

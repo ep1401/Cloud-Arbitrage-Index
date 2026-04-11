@@ -1,23 +1,3 @@
-"""
-Cloud Arbitrage Index (CAI) — Bandit + Event-Burst Probing Framework
-(Ensemble + 1h Probes + Hedge weights + Option B persistence-friendly)
-
-This version is the same logic you posted, with ONLY the changes needed so your
-Option B scheduler persistence works cleanly:
-
-Key updates (persistence compatibility):
-  1) Adds public aliases expected by the scheduler snapshot code:
-       - hedge_w    (normalized per-arm weights)  == hedge_weights
-       - hedge_loss (per-arm Hedge log-weights)   == _hedge_logw
-     So your scheduler can save/load without guessing attribute names.
-  2) Adds a safe restore hook you can call after you load a snapshot:
-       - apply_persisted_state(...)
-     (Your scheduler already assigns attributes directly, but this makes it robust.)
-  3) Keeps behavior identical for sampling, updating, and reporting.
-
-Minimal dep: numpy
-"""
-
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Callable, Optional, Deque, Any
