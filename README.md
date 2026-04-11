@@ -1,124 +1,223 @@
-# Cloud Arbitrage Index (CAI) — Termination Risk Modeling
+# Cloud Arbitrage Index (CAI)
 
-The Cloud Arbitrage Index (CAI) is a forward-looking risk metric designed to make **spot and preemptible cloud instances predictable and comparable across providers**. This repository implements the modeling pipeline used to estimate near-term termination risk for spot instances using historical probe data from AWS and Azure.
+A forward-looking risk metric for AWS Spot Instances.
 
-While spot instances offer steep cost discounts, their reliability is highly variable and difficult to reason about in practice. Provider-supplied metrics are typically coarse, backward-looking, or opaque, leaving engineers to choose between expensive on-demand capacity and unreliable spot usage. CAI addresses this gap by transforming raw probe measurements into **calibrated probability estimates of interruption over a specified time horizon**, enabling informed placement, scheduling, and multicloud arbitrage decisions.
+## Overview
 
-At its core, this project converts probe runs into a discrete-time survival modeling problem. Each run is decomposed into hourly slices, enriched with leakage-safe rolling features that capture recent market behavior such as launch failures and interruption history. These slice-level outcomes are then aggregated into a forward-looking, pool-level target that estimates the probability of at least one termination event occurring within the next `H` hours for a given `(provider, region, instance_type)` pool.
+Cloud Arbitrage Index (CAI) is a research project and modeling pipeline for estimating the near-term interruption risk of AWS Spot Instance pools. Rather than relying on coarse provider summaries such as long-window interruption buckets or opaque placement scores, CAI builds its own probe dataset and produces horizon-specific probability estimates that can support real scheduling and pool-selection decisions.
 
-The resulting model produces **interpretable, horizon-specific termination risk estimates** that can be compared consistently across regions, instance families, and cloud providers. By bridging active measurement with predictive modeling, CAI provides a practical foundation for risk-aware schedulers, deadline-sensitive workloads, and cost-optimized multicloud systems.
+This repository contains the code used for three connected parts of the project:
 
----
+1. **Active probing** of AWS Spot Instance pools across regions and instance types.
+2. **Risk modeling** to estimate whether a pool is likely to experience interruption in a fixed future window.
+3. **Policy evaluation** to test whether those predictions improve downstream cloud-allocation decisions.
 
-## What this code does
+The accompanying paper, **"Cloud Arbitrage Index (CAI): A Forward-Looking Risk Metric for Spot Instances,"** describes the research motivation, modeling decisions, evaluation framework, and empirical findings behind the code in this repository.
 
-Given historical probe logs, the pipeline performs the following steps:
+## Research question
 
-1. **Slice construction**  
-   Each successfully launched run is expanded into **1-hour slices**, where each slice is labeled with whether the run terminates during that hour.
+The central question behind CAI is simple:
 
-2. **Leakage-safe feature generation**  
-   A unified event timeline (slice events plus launch-failure events) is constructed so that all rolling features are computed using **past-only information**.
+> If a user plans to launch a Spot Instance in a given AWS pool within the next few hours, what is the probability that it will be interrupted before a one-hour job completes?
 
-3. **Forward-looking block-horizon target**  
-   For each `(provider, region, instance_type)` pool, slice outcomes are aggregated over the next `H` hours to produce:
-   - `y_block_horizon`: number of 1-hour slices in `[t, t + H)`
-   - `y_block_count`: number of those slices that terminated
-   - `y_block_rate`: `y_block_count / y_block_horizon`
-   - `y_block_bin`: indicator for whether *any* termination occurs in the block
+AWS exposes useful but limited signals, such as historical interruption ranges and spot price traces, but it does not provide a direct, forward-looking, horizon-specific estimate of termination risk. CAI is designed to fill that gap.
 
-4. **Model training**  
-   A **Poisson regression model** (HistGradientBoostingRegressor with `loss="poisson"`) is trained on `y_block_count`.
+## What the project does
 
-5. **Calibration**  
-   Predicted counts are converted to rates and scaled using a **single global calibration factor**, chosen to minimize fractional log loss on the training set.
+At a high level, the project works as follows:
 
-6. **Evaluation**  
-   Performance is evaluated using:
-   - Brier score (vs rate)
-   - Fractional log loss
-   - ROC-AUC on the “any termination in block” label
-   - Reliability tables
-   - Learning curves
+### 1. Probe the market directly
 
----
+Because AWS does not expose the termination logs needed for supervised modeling, CAI collects its own data by repeatedly launching Spot Instances and observing whether they survive a fixed one-hour window. The probing setup used in the paper focuses on six AWS pools formed by:
 
-## Project structure
-src/  
-cai_model/  
-cli.py # entrypoint  
-io.py # CSV loading and snapshot unpacking  
-features.py # slicing and rolling features  
-rolling.py # rolling-window utilities  
-targets.py # block-horizon target construction  
-model.py # Poisson regression model  
-weights.py # sample weighting  
-eval.py # metrics and reliability tables  
-viz.py # learning curves  
+- **Regions:** `us-east-1`, `us-west-2`
+- **Instance types:** `t3a.large`, `m6a.large`, `c6i.large`
+
+Each successful launch produces a one-hour probe outcome:
+
+- `interrupted = 1` if the instance is reclaimed during the hour
+- `interrupted = 0` if it survives the full hour and is then terminated by the scheduler
+
+Launches that never reach the running state are logged separately but excluded from the main modeling dataset.
+
+### 2. Compare probing strategies
+
+The repository includes code for two probing policies:
+
+- **Uniform baseline policy:** guarantees broad and steady coverage across pools
+- **Adaptive bandit policy:** allocates extra probes toward pools with greater uncertainty
+
+This makes it possible to compare whether smarter data collection improves downstream prediction quality under the same overall budget.
+
+### 3. Build a forward-looking target
+
+The model does not try to predict a single raw interruption event in isolation. Instead, it constructs a fixed-horizon target over the next **six hours**. For each pool and decision time, the pipeline aggregates future one-hour slices inside that horizon and estimates the empirical interruption rate in the upcoming block.
+
+This fixed-window formulation was chosen because it is more stable and data-efficient than trying to fit a full survival model from sparse, highly censored spot interruption data.
+
+### 4. Estimate risk with a baseline-plus-ML pipeline
+
+The final CAI pipeline combines:
+
+- a **pool-level statistical baseline** based on recent interruption behavior
+- a **machine learning correction model** that uses time, price, and pool identity features
+- a **calibration step** to improve the numerical reliability of predicted probabilities
+
+The final paper uses an **EWMA-based baseline**, a **Histogram Gradient Boosting** residual model, and **temperature scaling** for calibration.
+
+### 5. Evaluate decision usefulness, not just prediction accuracy
+
+CAI is evaluated both as a forecasting model and as a decision tool. The policy notebooks test whether better interruption-risk estimates lead to better pool choices under two objectives:
+
+- **Price-risk tradeoff:** choose pools that balance hourly cost and interruption risk
+- **Retry-cost objective:** choose pools that minimize expected total cost when failed jobs can be retried
+
+## Main findings from the paper
+
+The paper reports several key results:
+
+- Near-term spot interruption risk is **predictable enough to model meaningfully**.
+- The final CAI model outperforms simpler baselines such as EWMA-only, rolling 24-hour averages, fixed interruption mappings, and global averages on the main forecasting task.
+- A **baseline-plus-residual** formulation performs much better than a direct one-step machine learning alternative.
+- **Histogram Gradient Boosting** was the strongest of the candidate tree-based models studied.
+- The adaptive probing strategy improves downstream prediction slightly over the capped uniform strategy, though the improvement is modest.
+- Under a linear price-risk objective, CAI leads to better realized decisions than the baseline strategies tested.
+- Under the retry-cost objective, a simpler 24-hour average can sometimes perform better when the key challenge is ranking a very small set of candidate pools.
+
+That last result is important: stronger overall probabilistic forecasting does not automatically guarantee the best result for every downstream policy objective.
+
+## Repository structure
+
+The repository is organized around the three major parts of the project.
+
+```text
+Cloud-Arbitrage-Index/
+├── data/
+│   ├── probe_results_combined.csv
+│   ├── probe_results_rows.csv
+│   └── probe_results_topup_rows.csv
+├── src/
+│   ├── probing/
+│   │   ├── baseline_scheduler.py
+│   │   ├── bandit_scheduler.py
+│   │   └── cai_bandit.py
+│   └── cai_model/
+│       ├── CAI_Model.ipynb
+│       └── evaluation/
+│           ├── CAI_Learning_Curve.ipynb
+│           ├── CAI_ML_Model_Comparison.ipynb
+│           ├── CAI_Probing_Strategy_Comparison.ipynb
+│           └── policies/
+│               ├── Price_Risk_Policy.ipynb
+│               └── Retry_Cost_Policy.ipynb
+└── README.md
+```
+
+## Repository contents
+
+### `src/probing/`
+
+This directory contains the live probing and scheduling code used to collect AWS Spot data.
+
+- **`baseline_scheduler.py`**: runs the uniform capped probing policy and handles probe execution, logging, AWS interaction, and top-up behavior.
+- **`bandit_scheduler.py`**: runs the adaptive scheduler used to allocate probes based on uncertainty.
+- **`cai_bandit.py`**: contains the bandit logic and posterior-based uncertainty machinery used by the adaptive policy.
+
+The probing code interacts directly with AWS and stores results in a backend that includes Supabase logging.
+
+### `src/cai_model/`
+
+This directory contains the main modeling notebook and evaluation notebooks.
+
+- **`CAI_Model.ipynb`**: the primary modeling workflow used to build the final interruption-risk model.
+- **`evaluation/CAI_Learning_Curve.ipynb`**: evaluates how performance changes as more historical training data are added.
+- **`evaluation/CAI_ML_Model_Comparison.ipynb`**: compares model classes such as Decision Tree, XGBoost, and Histogram Gradient Boosting.
+- **`evaluation/CAI_Probing_Strategy_Comparison.ipynb`**: compares downstream performance using data collected from different probing policies.
+- **`evaluation/policies/Price_Risk_Policy.ipynb`**: evaluates the linear price-risk decision objective.
+- **`evaluation/policies/Retry_Cost_Policy.ipynb`**: evaluates the retry-based decision objective.
+
+### `data/`
+
+This directory contains the probe logs used in the notebook workflows.
+
+- **`probe_results_rows.csv`**: baseline probing results
+- **`probe_results_topup_rows.csv`**: top-up / additional probing results
+- **`probe_results_combined.csv`**: merged dataset used by the main model notebook
+
+## Data and feature notes
+
+The paper describes the final modeling dataset as containing roughly **7,500 one-hour probe outcomes**, ordered chronologically by run start time. The feature set is intentionally restricted to information available at launch time, including:
+
+- provider, region, and instance type
+- current spot price
+- normalized recent price behavior
+- cyclic time-of-day and day-of-week features
+- weekend indicator and coarse time block
+- recent pool-level interruption statistics used in the baseline estimate
+
+This keeps the pipeline leakage-safe and aligned with the real operational decision point.
+
+## How to use this repository
+
+This repository is currently notebook-centered rather than packaged as a polished installable library. The most practical way to work with it is:
+
+1. Start with **`src/cai_model/CAI_Model.ipynb`** for the main modeling pipeline.
+2. Use the notebooks in **`src/cai_model/evaluation/`** to reproduce the analyses in the paper.
+3. Use the files in **`src/probing/`** only if you want to study or extend the live probe-collection system.
+
+Because the probing scripts interact with AWS resources and an external Supabase backend, they should be reviewed carefully before being run in a new environment.
 
 ## Requirements
 
-- Python 3.9+
-- Dependencies:
-  - numpy
-  - pandas
-  - scikit-learn
-  - matplotlib
+The repository includes both notebook-based analysis and live cloud-probing code, so the exact environment depends on what you are trying to run.
 
-Install dependencies:  
-pip install numpy pandas scikit-learn matplotlib
+For the modeling notebooks, you will generally need:
 
----
+- Python 3.x
+- Jupyter / Google Colab
+- `pandas`
+- `numpy`
+- `matplotlib`
+- `scikit-learn`
 
-## Data format
+For the probing scripts, you will also need:
 
-The pipeline expects a CSV file with **at minimum** the following columns:
+- AWS credentials with permission to launch and terminate EC2 Spot Instances
+- `boto3`
+- `supabase`
+- any environment variables or credentials expected by the scripts
 
-- `provider`, `region`, `instance_type`
-- `start_time_utc`, `created_at`
-- `duration_minutes`, `interrupted`
-- `outcome`
+## Scope and limitations
 
-Optional:
+This repository reflects a research implementation developed for a Princeton independent work thesis. It is designed first as an empirical and methodological contribution, not as a production-ready cloud scheduling platform.
 
-- `features_snapshot`  
-  A JSON string containing launch-time metadata (for example, launch hour or price features).
+Important limitations noted in the paper include:
 
----
+- the study focuses only on AWS
+- the empirical evaluation uses only six pools
+- the dataset covers a limited time window under a fixed budget
+- the model predicts fixed-horizon risk rather than full time-to-failure curves
+- policy performance depends on the downstream decision objective
 
-## Running the model
+## Paper
 
-From the **repository root**, run:  
-python3 -m src.cai_model.cli
---csv-path data/probe_results_rows.csv
---block-hours 6
---outdir outputs
+The accompanying paper is:
 
+**Ethan Puckett, _Cloud Arbitrage Index (CAI): A Forward-Looking Risk Metric for Spot Instances_, Princeton University, April 16, 2026.**
 
-### Arguments
+If you are trying to understand the motivation, modeling choices, or evaluation methodology, the paper should be read alongside the code.
 
-- `--csv-path`  
-  Path to the probe results CSV file.
+## Citation
 
-- `--block-hours`  
-  Forward-looking horizon (in hours) over which termination risk is computed.
+If you use this repository or build on the project, please cite the paper and link back to this repository.
 
-- `--outdir`  
-  Directory where plots and CSV outputs are written.
+## Status
 
----
+This codebase is best understood as a research repository containing:
 
-## Outputs
+- live probing scripts
+- modeling notebooks
+- evaluation notebooks
+- the datasets used for the reported experiments
 
-The pipeline produces:
-
-- Learning curve plots:
-  - `learning_curve_roc.png`
-  - `learning_curve_brier.png`
-- `best_instances.csv`  
-  A subset of training slice-instances selected via random subset search that yields the best test performance.
-- Printed evaluation tables:
-  - Reliability table
-  - Per-pool Brier score comparisons
-  - Per-block actual vs predicted termination rates
-
+It is a good starting point for anyone interested in spot-market measurement, forward-looking interruption-risk modeling, adaptive probing, or cloud scheduling under uncertainty.
